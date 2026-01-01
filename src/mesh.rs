@@ -3,7 +3,7 @@
 //! Creates 3D meshes for each object type with proper geometry.
 
 use crate::config::hex_to_rgb;
-use crate::desk_object::ObjectType;
+use crate::desk_object::{ObjectState, ObjectType};
 use std::f32::consts::PI;
 
 /// Vertex data structure for 3D rendering
@@ -397,8 +397,20 @@ pub fn create_sphere(
     mesh
 }
 
-/// Create a clock mesh with frame, face, and markers
+/// Create a clock mesh with frame, face, markers, and hands
 pub fn create_clock(main_color: u32, accent_color: u32) -> MeshData {
+    // Default to 12:00:00 for initial display
+    create_clock_with_time(main_color, accent_color, 0.0, 0.0, 0.0)
+}
+
+/// Create a clock mesh with frame, face, markers, and animated hands
+pub fn create_clock_with_time(
+    main_color: u32,
+    accent_color: u32,
+    hour_angle: f32,
+    minute_angle: f32,
+    second_angle: f32,
+) -> MeshData {
     let mut mesh = MeshData::new();
 
     let (r, g, b) = hex_to_rgb(main_color);
@@ -431,6 +443,46 @@ pub fn create_clock(main_color: u32, accent_color: u32) -> MeshData {
         }
         mesh.merge(marker);
     }
+
+    // Clock hands
+    let hand_color = [0.1, 0.1, 0.1, 1.0];
+    let second_hand_color = [0.8, 0.1, 0.1, 1.0]; // Red second hand
+
+    // Hour hand (short and thick)
+    let mut hour_hand = create_box(0.012, 0.006, 0.08, hand_color, 0.42);
+    // Rotate hour hand
+    for v in &mut hour_hand.vertices {
+        let x = v.position[0];
+        let z = v.position[2] + 0.04; // Offset to rotate around one end
+        v.position[0] = x * hour_angle.cos() - z * hour_angle.sin();
+        v.position[2] = x * hour_angle.sin() + z * hour_angle.cos();
+    }
+    mesh.merge(hour_hand);
+
+    // Minute hand (longer and thinner)
+    let mut minute_hand = create_box(0.008, 0.006, 0.14, hand_color, 0.42);
+    // Rotate minute hand
+    for v in &mut minute_hand.vertices {
+        let x = v.position[0];
+        let z = v.position[2] + 0.07; // Offset to rotate around one end
+        v.position[0] = x * minute_angle.cos() - z * minute_angle.sin();
+        v.position[2] = x * minute_angle.sin() + z * minute_angle.cos();
+    }
+    mesh.merge(minute_hand);
+
+    // Second hand (thin and red)
+    let mut second_hand = create_box(0.004, 0.005, 0.16, second_hand_color, 0.43);
+    // Rotate second hand
+    for v in &mut second_hand.vertices {
+        let x = v.position[0];
+        let z = v.position[2] + 0.08; // Offset to rotate around one end
+        v.position[0] = x * second_angle.cos() - z * second_angle.sin();
+        v.position[2] = x * second_angle.sin() + z * second_angle.cos();
+    }
+    mesh.merge(second_hand);
+
+    // Center dot
+    mesh.merge(create_cylinder(0.015, 0.01, 8, hand_color, 0.44, true, true));
 
     mesh
 }
@@ -840,10 +892,145 @@ pub fn create_music_player(main_color: u32, accent_color: u32) -> MeshData {
     mesh
 }
 
+/// Create a pen mesh
+fn create_pen(main_color: u32, accent_color: u32) -> MeshData {
+    let mut mesh = MeshData::new();
+
+    let (r, g, b) = hex_to_rgb(main_color);
+    let main = [r, g, b, 1.0];
+    let (ar, ag, ab) = hex_to_rgb(accent_color);
+    let accent = [ar, ag, ab, 1.0];
+
+    // Pen body (elongated cylinder lying on desk)
+    let body_radius = 0.012;
+    let body_length = 0.18;
+    let segments = 8;
+
+    // Create pen body as a horizontal cylinder (along X axis)
+    for i in 0..segments {
+        let angle0 = (i as f32 / segments as f32) * 2.0 * PI;
+        let angle1 = ((i + 1) as f32 / segments as f32) * 2.0 * PI;
+
+        let y0 = body_radius * angle0.cos() + body_radius;
+        let z0 = body_radius * angle0.sin();
+        let y1 = body_radius * angle1.cos() + body_radius;
+        let z1 = body_radius * angle1.sin();
+
+        let nx0 = angle0.cos();
+        let nz0 = angle0.sin();
+        let nx1 = angle1.cos();
+        let nz1 = angle1.sin();
+
+        let base = mesh.vertices.len() as u16;
+
+        // Left end
+        mesh.vertices.push(Vertex {
+            position: [-body_length / 2.0, y0, z0],
+            normal: [0.0, nx0, nz0],
+            color: main,
+        });
+        mesh.vertices.push(Vertex {
+            position: [-body_length / 2.0, y1, z1],
+            normal: [0.0, nx1, nz1],
+            color: main,
+        });
+        // Right end
+        mesh.vertices.push(Vertex {
+            position: [body_length / 2.0 - 0.03, y0, z0],
+            normal: [0.0, nx0, nz0],
+            color: main,
+        });
+        mesh.vertices.push(Vertex {
+            position: [body_length / 2.0 - 0.03, y1, z1],
+            normal: [0.0, nx1, nz1],
+            color: main,
+        });
+
+        mesh.indices.extend_from_slice(&[
+            base, base + 2, base + 1,
+            base + 1, base + 2, base + 3,
+        ]);
+    }
+
+    // Pen tip (cone) - accent color
+    let tip_start_x = body_length / 2.0 - 0.03;
+    let tip_end_x = body_length / 2.0;
+
+    for i in 0..segments {
+        let angle0 = (i as f32 / segments as f32) * 2.0 * PI;
+        let angle1 = ((i + 1) as f32 / segments as f32) * 2.0 * PI;
+
+        let y0 = body_radius * angle0.cos() + body_radius;
+        let z0 = body_radius * angle0.sin();
+        let y1 = body_radius * angle1.cos() + body_radius;
+        let z1 = body_radius * angle1.sin();
+
+        let base = mesh.vertices.len() as u16;
+
+        // Cone from body radius to point
+        mesh.vertices.push(Vertex {
+            position: [tip_start_x, y0, z0],
+            normal: [0.5, angle0.cos() * 0.5, angle0.sin() * 0.5],
+            color: accent,
+        });
+        mesh.vertices.push(Vertex {
+            position: [tip_start_x, y1, z1],
+            normal: [0.5, angle1.cos() * 0.5, angle1.sin() * 0.5],
+            color: accent,
+        });
+        mesh.vertices.push(Vertex {
+            position: [tip_end_x, body_radius, 0.0],
+            normal: [1.0, 0.0, 0.0],
+            color: accent,
+        });
+
+        mesh.indices.extend_from_slice(&[base, base + 2, base + 1]);
+    }
+
+    // Pen clip (accent color, small flat piece on top)
+    let clip = create_box(0.06, 0.003, 0.008, accent, body_radius * 2.0 + 0.001);
+    mesh.merge(clip);
+
+    // Cap end (small cylinder at the back)
+    let cap_color = [r * 0.7, g * 0.7, b * 0.7, 1.0];
+    let mut cap = create_cylinder(body_radius * 1.1, 0.015, 8, cap_color, 0.0, true, true);
+    for v in &mut cap.vertices {
+        // Rotate 90 degrees around Z axis to make it horizontal
+        let old_x = v.position[0];
+        v.position[0] = -body_length / 2.0 - 0.007;
+        v.position[1] = old_x + body_radius;
+    }
+    mesh.merge(cap);
+
+    mesh
+}
+
 /// Generate mesh for a given object type
 pub fn generate_object_mesh(object_type: ObjectType, main_color: u32, accent_color: u32) -> MeshData {
+    generate_object_mesh_with_state(object_type, main_color, accent_color, None)
+}
+
+/// Generate mesh for a given object type with optional state for animated objects
+pub fn generate_object_mesh_with_state(
+    object_type: ObjectType,
+    main_color: u32,
+    accent_color: u32,
+    state: Option<&ObjectState>,
+) -> MeshData {
     match object_type {
-        ObjectType::Clock => create_clock(main_color, accent_color),
+        ObjectType::Clock => {
+            if let Some(s) = state {
+                create_clock_with_time(
+                    main_color,
+                    accent_color,
+                    s.clock_hour_angle,
+                    s.clock_minute_angle,
+                    s.clock_second_angle,
+                )
+            } else {
+                create_clock(main_color, accent_color)
+            }
+        }
         ObjectType::Lamp => create_lamp(main_color, accent_color),
         ObjectType::Plant => create_plant(main_color, accent_color),
         ObjectType::Coffee => create_coffee(main_color, accent_color),
@@ -859,5 +1046,6 @@ pub fn generate_object_mesh(object_type: ObjectType, main_color: u32, accent_col
         ObjectType::Paper => create_paper(main_color, accent_color),
         ObjectType::Magazine => create_magazine(main_color, accent_color),
         ObjectType::MusicPlayer => create_music_player(main_color, accent_color),
+        ObjectType::Pen => create_pen(main_color, accent_color),
     }
 }

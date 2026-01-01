@@ -26,6 +26,53 @@ pub enum ObjectType {
     Paper,
     Magazine,
     MusicPlayer,
+    Pen,
+}
+
+/// Drink types for the coffee mug
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DrinkType {
+    #[default]
+    Coffee,
+    Tea,
+    HotChocolate,
+    Water,
+    Milk,
+}
+
+impl DrinkType {
+    /// Get the color for this drink type (RGB hex)
+    pub fn color(&self) -> u32 {
+        match self {
+            DrinkType::Coffee => 0x3d2314,      // Dark brown
+            DrinkType::Tea => 0xc68b59,         // Amber/tea color
+            DrinkType::HotChocolate => 0x4a3728, // Chocolate brown
+            DrinkType::Water => 0x87ceeb,       // Light blue
+            DrinkType::Milk => 0xfdfff5,        // Off-white
+        }
+    }
+
+    /// Get display name
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DrinkType::Coffee => "Coffee",
+            DrinkType::Tea => "Tea",
+            DrinkType::HotChocolate => "Hot Chocolate",
+            DrinkType::Water => "Water",
+            DrinkType::Milk => "Milk",
+        }
+    }
+
+    /// Get all drink types
+    pub fn all() -> &'static [DrinkType] {
+        &[
+            DrinkType::Coffee,
+            DrinkType::Tea,
+            DrinkType::HotChocolate,
+            DrinkType::Water,
+            DrinkType::Milk,
+        ]
+    }
 }
 
 /// Object-specific interactive state
@@ -74,6 +121,34 @@ pub struct ObjectState {
     /// Metronome: Beats per minute
     #[serde(default = "default_bpm")]
     pub metronome_bpm: u32,
+
+    /// Coffee Mug: Drink type
+    #[serde(default)]
+    pub drink_type: DrinkType,
+
+    /// Coffee Mug: Fill level (0.0 to 1.0)
+    #[serde(default = "default_fill_level")]
+    pub fill_level: f32,
+
+    /// Coffee Mug: Whether the drink is hot (shows steam)
+    #[serde(default)]
+    pub is_hot: bool,
+
+    /// Clock: Current hour angle (radians, calculated from real time)
+    #[serde(skip)]
+    pub clock_hour_angle: f32,
+
+    /// Clock: Current minute angle (radians, calculated from real time)
+    #[serde(skip)]
+    pub clock_minute_angle: f32,
+
+    /// Clock: Current second angle (radians, calculated from real time)
+    #[serde(skip)]
+    pub clock_second_angle: f32,
+}
+
+fn default_fill_level() -> f32 {
+    0.8
 }
 
 fn default_volume() -> f32 {
@@ -104,6 +179,7 @@ impl ObjectType {
             ObjectType::Paper => "Paper",
             ObjectType::Magazine => "Magazine",
             ObjectType::MusicPlayer => "Music Player",
+            ObjectType::Pen => "Pen",
         }
     }
 
@@ -126,6 +202,7 @@ impl ObjectType {
             ObjectType::Paper => "\u{1F4C4}", // Page
             ObjectType::Magazine => "\u{1F4F0}", // Newspaper
             ObjectType::MusicPlayer => "\u{1F3B6}", // Musical notes
+            ObjectType::Pen => "\u{1F58A}", // Pen
         }
     }
 
@@ -148,6 +225,7 @@ impl ObjectType {
             ObjectType::Paper => 0xffffff,
             ObjectType::Magazine => 0xef4444,
             ObjectType::MusicPlayer => 0x1e293b,
+            ObjectType::Pen => 0x3b82f6,
         }
     }
 
@@ -170,6 +248,7 @@ impl ObjectType {
             ObjectType::Paper => 0x000000,
             ObjectType::Magazine => 0xffffff,
             ObjectType::MusicPlayer => 0x22c55e,
+            ObjectType::Pen => 0x1e293b,
         }
     }
 
@@ -304,6 +383,14 @@ impl ObjectType {
                 friction: 0.55,
                 no_stacking_on_top: false,
             },
+            ObjectType::Pen => ObjectPhysics {
+                weight: 0.05,
+                stability: 0.3,
+                height: 0.02,
+                base_offset: 0.0,
+                friction: 0.4,
+                no_stacking_on_top: false,
+            },
         }
     }
 
@@ -326,6 +413,7 @@ impl ObjectType {
             ObjectType::Paper,
             ObjectType::Magazine,
             ObjectType::MusicPlayer,
+            ObjectType::Pen,
         ]
     }
 
@@ -340,6 +428,7 @@ impl ObjectType {
                 | ObjectType::PhotoFrame
                 | ObjectType::Metronome
                 | ObjectType::MusicPlayer
+                | ObjectType::Coffee
         )
     }
 }

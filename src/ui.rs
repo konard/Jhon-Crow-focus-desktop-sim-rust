@@ -4,7 +4,7 @@
 //! - Left sidebar: Object palette with categories (like the reference Electron app)
 //! - Right sidebar: Object customization panel (colors, delete)
 
-use crate::desk_object::ObjectType;
+use crate::desk_object::{DrinkType, ObjectType};
 use egui::{Color32, RichText, Vec2};
 
 /// Palette category for organizing object types
@@ -120,6 +120,11 @@ impl UiState {
                     PaletteVariant {
                         object_type: ObjectType::PenHolder,
                         name: "Pen Holder",
+                        icon: "🖊️",
+                    },
+                    PaletteVariant {
+                        object_type: ObjectType::Pen,
+                        name: "Pen",
                         icon: "🖊️",
                     },
                 ],
@@ -268,6 +273,12 @@ pub enum UiAction {
     ToggleMusicPlayer(u64),
     /// Select photo for photo frame
     SelectPhoto(u64),
+    /// Change drink type in coffee mug
+    ChangeDrinkType(u64, DrinkType),
+    /// Change fill level in coffee mug
+    ChangeFillLevel(u64, f32),
+    /// Toggle hot/cold for coffee mug
+    ToggleHot(u64),
     /// No action
     None,
 }
@@ -407,6 +418,9 @@ pub struct ObjectInfo {
     pub metronome_running: bool,
     pub metronome_bpm: u32,
     pub music_playing: bool,
+    pub drink_type: DrinkType,
+    pub fill_level: f32,
+    pub is_hot: bool,
 }
 
 /// Render the right sidebar (object customization)
@@ -595,6 +609,94 @@ pub fn render_right_sidebar(
 
                         if ui.add(select_btn).clicked() {
                             actions.push(UiAction::SelectPhoto(object_id));
+                        }
+
+                        ui.add_space(15.0);
+                        ui.separator();
+                        ui.add_space(15.0);
+                    }
+                    ObjectType::Coffee => {
+                        ui.label(RichText::new("COFFEE MUG CONTROLS").size(11.0).color(Color32::from_gray(150)));
+                        ui.add_space(8.0);
+
+                        // Drink type selection
+                        ui.label(RichText::new("Drink Type:").size(12.0).color(Color32::from_gray(200)));
+                        ui.add_space(4.0);
+
+                        ui.horizontal_wrapped(|ui| {
+                            for drink in DrinkType::all() {
+                                let is_selected = info.drink_type == *drink;
+                                let color = drink.color();
+                                let r = ((color >> 16) & 0xFF) as u8;
+                                let g = ((color >> 8) & 0xFF) as u8;
+                                let b = (color & 0xFF) as u8;
+
+                                let btn = egui::Button::new(
+                                    RichText::new(drink.display_name())
+                                        .size(11.0)
+                                        .color(if is_selected { Color32::WHITE } else { Color32::from_gray(200) }),
+                                )
+                                .fill(if is_selected {
+                                    Color32::from_rgb(r, g, b)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(r, g, b, 80)
+                                })
+                                .min_size(Vec2::new(70.0, 28.0));
+
+                                if ui.add(btn).clicked() {
+                                    actions.push(UiAction::ChangeDrinkType(object_id, *drink));
+                                }
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // Fill level slider
+                        ui.label(RichText::new(format!("Fill Level: {:.0}%", info.fill_level * 100.0)).size(12.0).color(Color32::from_gray(200)));
+                        ui.add_space(4.0);
+
+                        // Using buttons for fill level adjustment
+                        ui.horizontal(|ui| {
+                            for level in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                                let is_selected = (info.fill_level - level).abs() < 0.05;
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("{:.0}%", level * 100.0))
+                                        .size(11.0)
+                                        .color(if is_selected { Color32::WHITE } else { Color32::from_gray(180) }),
+                                )
+                                .fill(if is_selected {
+                                    Color32::from_rgb(79, 70, 229)
+                                } else {
+                                    Color32::from_gray(60)
+                                })
+                                .min_size(Vec2::new(42.0, 28.0));
+
+                                if ui.add(btn).clicked() {
+                                    actions.push(UiAction::ChangeFillLevel(object_id, level));
+                                }
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // Hot/Cold toggle
+                        let hot_status = if info.is_hot { "Hot ☕" } else { "Cold" };
+                        let hot_color = if info.is_hot {
+                            Color32::from_rgb(239, 68, 68)
+                        } else {
+                            Color32::from_gray(80)
+                        };
+
+                        let hot_btn = egui::Button::new(
+                            RichText::new(format!("Temperature: {}", hot_status))
+                                .size(14.0)
+                                .color(Color32::WHITE),
+                        )
+                        .fill(hot_color)
+                        .min_size(Vec2::new(ui.available_width() - 20.0, 40.0));
+
+                        if ui.add(hot_btn).clicked() {
+                            actions.push(UiAction::ToggleHot(object_id));
                         }
 
                         ui.add_space(15.0);

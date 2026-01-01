@@ -14,7 +14,7 @@ mod ui;
 use camera::Camera;
 use config::{hex_to_rgb, hex_to_rgba, CONFIG};
 use desk_object::{DeskObject, ObjectType};
-use mesh::{generate_object_mesh, MeshData, Vertex};
+use mesh::{generate_object_mesh, generate_object_mesh_with_state, MeshData, Vertex};
 use physics::PhysicsEngine;
 use state::AppState;
 use ui::{render_left_sidebar, render_right_sidebar, ObjectInfo, UiAction, UiState};
@@ -401,11 +401,15 @@ impl App {
     }
 
     fn create_object_mesh(&mut self, obj: &DeskObject) {
-        self.create_object_mesh_from_data(
-            obj.id,
+        let mesh_data = generate_object_mesh_with_state(
             obj.object_type,
             obj.color,
             obj.accent_color,
+            Some(&obj.state),
+        );
+        self.create_object_mesh_from_mesh_data(
+            obj.id,
+            mesh_data,
             obj.position,
             obj.rotation,
             obj.scale,
@@ -423,6 +427,17 @@ impl App {
         scale: f32,
     ) {
         let mesh_data = generate_object_mesh(object_type, color, accent_color);
+        self.create_object_mesh_from_mesh_data(id, mesh_data, position, rotation, scale);
+    }
+
+    fn create_object_mesh_from_mesh_data(
+        &mut self,
+        id: u64,
+        mesh_data: MeshData,
+        position: Vec3,
+        rotation: Quat,
+        scale: f32,
+    ) {
         let gpu_mesh = GpuMesh::from_mesh_data(&self.device, &mesh_data);
 
         let model_uniform = ModelUniform::from_transform(position, rotation, scale);
@@ -495,8 +510,39 @@ impl App {
 
         // Update animated objects
         let mut animation_updates: Vec<(u64, Quat)> = Vec::new();
+        let mut clock_updates: Vec<u64> = Vec::new();
+
+        // Get current time for clock updates
+        let current_time = chrono::Local::now();
+        let hours = current_time.format("%H").to_string().parse::<f32>().unwrap_or(0.0);
+        let minutes = current_time.format("%M").to_string().parse::<f32>().unwrap_or(0.0);
+        let seconds = current_time.format("%S").to_string().parse::<f32>().unwrap_or(0.0);
+        let millis = current_time.format("%3f").to_string().parse::<f32>().unwrap_or(0.0) / 1000.0;
+
         for obj in &mut self.state.objects {
             match obj.object_type {
+                ObjectType::Clock => {
+                    // Calculate clock hand angles based on real time
+                    // Hours: 360 degrees / 12 hours = 30 degrees per hour + minute offset
+                    let hour_12 = hours % 12.0;
+                    let hour_angle = -(hour_12 + minutes / 60.0) * (std::f32::consts::TAU / 12.0);
+                    // Minutes: 360 degrees / 60 minutes = 6 degrees per minute + second offset
+                    let minute_angle = -(minutes + seconds / 60.0) * (std::f32::consts::TAU / 60.0);
+                    // Seconds: 360 degrees / 60 seconds = 6 degrees per second (smooth with millis)
+                    let second_angle = -(seconds + millis) * (std::f32::consts::TAU / 60.0);
+
+                    // Check if angles changed significantly (avoid constant rebuilds)
+                    let hour_changed = (obj.state.clock_hour_angle - hour_angle).abs() > 0.01;
+                    let minute_changed = (obj.state.clock_minute_angle - minute_angle).abs() > 0.01;
+                    let second_changed = (obj.state.clock_second_angle - second_angle).abs() > 0.01;
+
+                    if hour_changed || minute_changed || second_changed {
+                        obj.state.clock_hour_angle = hour_angle;
+                        obj.state.clock_minute_angle = minute_angle;
+                        obj.state.clock_second_angle = second_angle;
+                        clock_updates.push(obj.id);
+                    }
+                }
                 ObjectType::Globe if obj.state.globe_rotating => {
                     // Rotate globe around Y axis
                     obj.state.globe_angle += dt * 0.5; // Rotation speed
@@ -525,6 +571,14 @@ impl App {
                     animation_updates.push((obj.id, new_rotation));
                 }
                 _ => {}
+            }
+        }
+
+        // Rebuild clock meshes with updated hand positions
+        for id in clock_updates {
+            if let Some(obj) = self.state.get_object(id).cloned() {
+                self.object_meshes.remove(&id);
+                self.create_object_mesh(&obj);
             }
         }
 
@@ -647,6 +701,9 @@ impl App {
                         metronome_running: obj.state.metronome_running,
                         metronome_bpm: obj.state.metronome_bpm,
                         music_playing: obj.state.music_playing,
+                        drink_type: obj.state.drink_type,
+                        fill_level: obj.state.fill_level,
+                        is_hot: obj.state.is_hot,
                     },
                 )
             }).map_or((None, None), |(name, info)| (Some(name), Some(info)))
@@ -808,6 +865,32 @@ impl App {
                 // Photo selection would normally open a file dialog
                 // For now, we just log the action
                 info!("Photo selection requested for frame {}", id);
+            }
+            UiAction::ChangeDrinkType(id, drink_type) => {
+                if let Some(obj) = self.state.get_object_mut(id) {
+                    obj.state.drink_type = drink_type;
+                    info!("Coffee mug {} drink type changed to {:?}", id, drink_type);
+                    // Rebuild mesh to show new drink color
+                    let obj_clone = obj.clone();
+                    self.object_meshes.remove(&id);
+                    self.create_object_mesh(&obj_clone);
+                }
+            }
+            UiAction::ChangeFillLevel(id, fill_level) => {
+                if let Some(obj) = self.state.get_object_mut(id) {
+                    obj.state.fill_level = fill_level;
+                    info!("Coffee mug {} fill level changed to {:.0}%", id, fill_level * 100.0);
+                    // Rebuild mesh to show new fill level
+                    let obj_clone = obj.clone();
+                    self.object_meshes.remove(&id);
+                    self.create_object_mesh(&obj_clone);
+                }
+            }
+            UiAction::ToggleHot(id) => {
+                if let Some(obj) = self.state.get_object_mut(id) {
+                    obj.state.is_hot = !obj.state.is_hot;
+                    info!("Coffee mug {} is now {}", id, if obj.state.is_hot { "hot" } else { "cold" });
+                }
             }
             UiAction::None => {}
         }
