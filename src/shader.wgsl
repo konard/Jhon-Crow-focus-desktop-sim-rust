@@ -1,5 +1,5 @@
 // Focus Desktop Simulator - Main Shader
-// WGSL shader for 3D rendering with basic lighting
+// WGSL shader for 3D rendering with basic lighting and model transforms
 
 // Camera uniform buffer
 struct CameraUniform {
@@ -7,8 +7,16 @@ struct CameraUniform {
     position: vec4<f32>,
 }
 
+// Model uniform buffer for per-object transforms
+struct ModelUniform {
+    model: mat4x4<f32>,
+}
+
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
+
+@group(1) @binding(0)
+var<uniform> model: ModelUniform;
 
 // Vertex input
 struct VertexInput {
@@ -30,12 +38,23 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    // Transform to clip space
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
+    // Transform position by model matrix first, then by view-projection
+    let world_pos = model.model * vec4<f32>(in.position, 1.0);
+    out.clip_position = camera.view_proj * world_pos;
 
-    // Pass through world position and normal
-    out.world_position = in.position;
-    out.world_normal = in.normal;
+    // Pass through world position
+    out.world_position = world_pos.xyz;
+
+    // Transform normal by model matrix (ignoring translation)
+    // For proper normal transformation we should use the inverse transpose,
+    // but for uniform scaling this is equivalent
+    let normal_transform = mat3x3<f32>(
+        model.model[0].xyz,
+        model.model[1].xyz,
+        model.model[2].xyz
+    );
+    out.world_normal = normalize(normal_transform * in.normal);
+
     out.color = in.color;
 
     return out;

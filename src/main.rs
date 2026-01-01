@@ -1,22 +1,25 @@
 //! Focus Desktop Simulator - A high-performance desktop simulator
 //!
 //! A Rust implementation of the Focus Desktop Simulator with an isometric 3D desk
-//! and interactive objects. Uses wgpu for GPU rendering and egui for UI.
+//! and interactive objects. Uses wgpu for GPU rendering.
 
 mod camera;
 mod config;
 mod desk_object;
+mod mesh;
 mod physics;
 mod state;
 
 use camera::Camera;
-use config::{hex_to_rgba, CONFIG};
+use config::{hex_to_rgb, hex_to_rgba, CONFIG};
 use desk_object::{DeskObject, ObjectType};
+use mesh::{generate_object_mesh, MeshData, Vertex};
 use physics::PhysicsEngine;
 use state::AppState;
 
-use glam::Vec3;
+use glam::{Mat4, Quat, Vec3};
 use log::info;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -27,31 +30,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
-
-/// Vertex data structure for 3D rendering
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    color: [f32; 4],
-}
-
-impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
-        0 => Float32x3,
-        1 => Float32x3,
-        2 => Float32x4,
-    ];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
-        }
-    }
-}
 
 /// Camera uniform buffer data
 #[repr(C)]
@@ -64,7 +42,7 @@ struct CameraUniform {
 impl CameraUniform {
     fn new() -> Self {
         Self {
-            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             position: [0.0; 4],
         }
     }
@@ -80,11 +58,55 @@ impl CameraUniform {
     }
 }
 
-/// Mesh data
-struct Mesh {
+/// Model uniform buffer data for per-object transforms
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ModelUniform {
+    model: [[f32; 4]; 4],
+}
+
+impl ModelUniform {
+    fn new() -> Self {
+        Self {
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+        }
+    }
+
+    fn from_transform(position: Vec3, rotation: Quat, scale: f32) -> Self {
+        let model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rotation, position);
+        Self {
+            model: model.to_cols_array_2d(),
+        }
+    }
+}
+
+/// GPU mesh handle
+struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+}
+
+impl GpuMesh {
+    fn from_mesh_data(device: &wgpu::Device, data: &MeshData) -> Self {
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Object Vertex Buffer"),
+            contents: bytemuck::cast_slice(&data.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Object Index Buffer"),
+            contents: bytemuck::cast_slice(&data.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        Self {
+            vertex_buffer,
+            index_buffer,
+            num_indices: data.indices.len() as u32,
+        }
+    }
 }
 
 /// Main application state
@@ -98,10 +120,11 @@ struct App {
     render_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    model_bind_group_layout: wgpu::BindGroupLayout,
     depth_texture: wgpu::TextureView,
-    desk_mesh: Mesh,
-    floor_mesh: Mesh,
-    cube_mesh: Mesh,
+    desk_mesh: GpuMesh,
+    floor_mesh: GpuMesh,
+    object_meshes: HashMap<u64, (GpuMesh, wgpu::Buffer, wgpu::BindGroup)>,
     camera: Camera,
     state: AppState,
     physics: PhysicsEngine,
@@ -110,7 +133,7 @@ struct App {
     dragging_object_id: Option<u64>,
     last_frame_time: Instant,
     shift_pressed: bool,
-    menu_open: bool,
+    current_object_type_index: usize,
 }
 
 impl App {
@@ -151,7 +174,9 @@ impl App {
 
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats.iter()
+        let surface_format = surface_caps
+            .formats
+            .iter()
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
@@ -183,19 +208,20 @@ impl App {
         });
 
         // Create camera bind group layout
-        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-            label: Some("camera_bind_group_layout"),
-        });
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout"),
+            });
 
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &camera_bind_group_layout,
@@ -206,12 +232,29 @@ impl App {
             label: Some("camera_bind_group"),
         });
 
+        // Create model bind group layout for per-object transforms
+        let model_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("model_bind_group_layout"),
+            });
+
         // Create render pipeline
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&camera_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[&camera_bind_group_layout, &model_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
@@ -227,7 +270,7 @@ impl App {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -259,10 +302,9 @@ impl App {
         // Create depth texture
         let depth_texture = Self::create_depth_texture(&device, &config);
 
-        // Create meshes
+        // Create static meshes
         let desk_mesh = Self::create_desk_mesh(&device);
         let floor_mesh = Self::create_floor_mesh(&device);
-        let cube_mesh = Self::create_cube_mesh(&device);
 
         // Create camera
         let camera = Camera::new(aspect);
@@ -272,7 +314,7 @@ impl App {
         let mut physics = PhysicsEngine::new();
         physics.collision_radius_multiplier = app_state.collision_radius_multiplier;
 
-        Ok(Self {
+        let mut app = Self {
             window,
             surface,
             device,
@@ -282,10 +324,11 @@ impl App {
             render_pipeline,
             camera_buffer,
             camera_bind_group,
+            model_bind_group_layout,
             depth_texture,
             desk_mesh,
             floor_mesh,
-            cube_mesh,
+            object_meshes: HashMap::new(),
             camera,
             state: app_state,
             physics,
@@ -294,8 +337,87 @@ impl App {
             dragging_object_id: None,
             last_frame_time: Instant::now(),
             shift_pressed: false,
-            menu_open: false,
-        })
+            current_object_type_index: 0,
+        };
+
+        // Create meshes for existing objects
+        app.rebuild_object_meshes();
+
+        Ok(app)
+    }
+
+    fn rebuild_object_meshes(&mut self) {
+        self.object_meshes.clear();
+        let objects: Vec<DeskObject> = self.state.objects.clone();
+        for obj in objects {
+            self.create_object_mesh_from_data(
+                obj.id,
+                obj.object_type,
+                obj.color,
+                obj.accent_color,
+                obj.position,
+                obj.rotation,
+                obj.scale,
+            );
+        }
+    }
+
+    fn create_object_mesh(&mut self, obj: &DeskObject) {
+        self.create_object_mesh_from_data(
+            obj.id,
+            obj.object_type,
+            obj.color,
+            obj.accent_color,
+            obj.position,
+            obj.rotation,
+            obj.scale,
+        );
+    }
+
+    fn create_object_mesh_from_data(
+        &mut self,
+        id: u64,
+        object_type: ObjectType,
+        color: u32,
+        accent_color: u32,
+        position: Vec3,
+        rotation: Quat,
+        scale: f32,
+    ) {
+        let mesh_data = generate_object_mesh(object_type, color, accent_color);
+        let gpu_mesh = GpuMesh::from_mesh_data(&self.device, &mesh_data);
+
+        let model_uniform = ModelUniform::from_transform(position, rotation, scale);
+        let model_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Model Buffer"),
+                contents: bytemuck::cast_slice(&[model_uniform]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let model_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.model_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: model_buffer.as_entire_binding(),
+            }],
+            label: Some("model_bind_group"),
+        });
+
+        self.object_meshes
+            .insert(id, (gpu_mesh, model_buffer, model_bind_group));
+    }
+
+    fn update_object_transform(&mut self, id: u64) {
+        if let Some(obj) = self.state.get_object(id) {
+            if let Some((_, buffer, _)) = self.object_meshes.get(&id) {
+                let model_uniform =
+                    ModelUniform::from_transform(obj.position, obj.rotation, obj.scale);
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(&[model_uniform]));
+            }
+        }
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -305,7 +427,8 @@ impl App {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.depth_texture = Self::create_depth_texture(&self.device, &self.config);
-            self.camera.set_aspect(new_size.width as f32 / new_size.height as f32);
+            self.camera
+                .set_aspect(new_size.width as f32 / new_size.height as f32);
         }
     }
 
@@ -314,18 +437,59 @@ impl App {
         let _dt = (now - self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
 
+        // Update physics for dropping objects
+        let objects_clone: Vec<DeskObject> = self.state.objects.clone();
+        let mut updated_ids: Vec<u64> = Vec::new();
+        for obj in &mut self.state.objects {
+            if !obj.is_dragging {
+                if self
+                    .physics
+                    .update_dropping(obj, &objects_clone, CONFIG.physics.drop_speed)
+                {
+                    updated_ids.push(obj.id);
+                }
+            }
+        }
+
+        for id in updated_ids {
+            self.update_object_transform(id);
+        }
+
         // Update camera uniform
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update(&self.camera);
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
     }
 
     fn render(&self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        // Create identity model matrix for static meshes
+        let identity_model = ModelUniform::new();
+        let identity_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Identity Model Buffer"),
+                contents: bytemuck::cast_slice(&[identity_model]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let identity_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.model_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: identity_buffer.as_entire_binding(),
+            }],
+            label: Some("identity_model_bind_group"),
         });
 
         {
@@ -359,22 +523,33 @@ impl App {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &identity_bind_group, &[]);
 
             // Render floor
             render_pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.floor_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(
+                self.floor_mesh.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
             render_pass.draw_indexed(0..self.floor_mesh.num_indices, 0, 0..1);
 
             // Render desk
             render_pass.set_vertex_buffer(0, self.desk_mesh.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.desk_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(
+                self.desk_mesh.index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
             render_pass.draw_indexed(0..self.desk_mesh.num_indices, 0, 0..1);
 
-            // Render objects as cubes
-            for _obj in &self.state.objects {
-                render_pass.set_vertex_buffer(0, self.cube_mesh.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(self.cube_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..self.cube_mesh.num_indices, 0, 0..1);
+            // Render objects with their transforms
+            for obj in &self.state.objects {
+                if let Some((mesh, _, bind_group)) = self.object_meshes.get(&obj.id) {
+                    render_pass.set_bind_group(1, bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass
+                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
             }
         }
 
@@ -390,7 +565,14 @@ impl App {
                 if *button == MouseButton::Left {
                     self.left_mouse_down = *state == ElementState::Pressed;
                     if !self.left_mouse_down {
-                        self.dragging_object_id = None;
+                        // End drag
+                        if let Some(id) = self.dragging_object_id.take() {
+                            let objects_clone: Vec<DeskObject> = self.state.objects.clone();
+                            if let Some(obj) = self.state.get_object_mut(id) {
+                                self.physics.end_drag(obj, &objects_clone);
+                                self.update_object_transform(id);
+                            }
+                        }
                     } else {
                         self.try_pick_object();
                     }
@@ -411,9 +593,11 @@ impl App {
                     if self.shift_pressed {
                         if let Some(obj) = self.state.get_object_mut(id) {
                             obj.scale = (obj.scale + scroll * 0.1).clamp(0.3, 3.0);
+                            self.update_object_transform(id);
                         }
                     } else if let Some(obj) = self.state.get_object_mut(id) {
-                        obj.rotation = glam::Quat::from_rotation_y(scroll * 0.2) * obj.rotation;
+                        obj.rotation = Quat::from_rotation_y(scroll * 0.2) * obj.rotation;
+                        self.update_object_transform(id);
                     }
                 }
             }
@@ -424,8 +608,64 @@ impl App {
                             self.shift_pressed = event.state == ElementState::Pressed;
                         }
                         KeyCode::KeyA if event.state == ElementState::Pressed => {
-                            // Add a random object
-                            self.add_object(ObjectType::Coffee);
+                            // Add object of current type
+                            let object_types = [
+                                ObjectType::Clock,
+                                ObjectType::Lamp,
+                                ObjectType::Plant,
+                                ObjectType::Coffee,
+                                ObjectType::Laptop,
+                                ObjectType::Notebook,
+                                ObjectType::PenHolder,
+                                ObjectType::Books,
+                                ObjectType::PhotoFrame,
+                                ObjectType::Globe,
+                                ObjectType::Trophy,
+                                ObjectType::Hourglass,
+                                ObjectType::Metronome,
+                                ObjectType::Paper,
+                                ObjectType::Magazine,
+                            ];
+                            let obj_type = object_types[self.current_object_type_index];
+                            self.add_object(obj_type);
+                            info!(
+                                "Added {} (Press T to cycle types, A to add)",
+                                obj_type.display_name()
+                            );
+                        }
+                        KeyCode::KeyT if event.state == ElementState::Pressed => {
+                            // Cycle through object types
+                            self.current_object_type_index =
+                                (self.current_object_type_index + 1) % 15;
+                            let object_types = [
+                                ObjectType::Clock,
+                                ObjectType::Lamp,
+                                ObjectType::Plant,
+                                ObjectType::Coffee,
+                                ObjectType::Laptop,
+                                ObjectType::Notebook,
+                                ObjectType::PenHolder,
+                                ObjectType::Books,
+                                ObjectType::PhotoFrame,
+                                ObjectType::Globe,
+                                ObjectType::Trophy,
+                                ObjectType::Hourglass,
+                                ObjectType::Metronome,
+                                ObjectType::Paper,
+                                ObjectType::Magazine,
+                            ];
+                            info!(
+                                "Selected: {} (Press A to add)",
+                                object_types[self.current_object_type_index].display_name()
+                            );
+                        }
+                        KeyCode::Delete if event.state == ElementState::Pressed => {
+                            // Delete dragged object
+                            if let Some(id) = self.dragging_object_id.take() {
+                                self.state.remove_object(id);
+                                self.object_meshes.remove(&id);
+                                info!("Deleted object");
+                            }
                         }
                         _ => {}
                     }
@@ -455,7 +695,9 @@ impl App {
         for obj in &self.state.objects {
             let to_obj = obj.position - ray_origin;
             let t = to_obj.dot(ray_world);
-            if t < 0.0 { continue; }
+            if t < 0.0 {
+                continue;
+            }
 
             let closest = ray_origin + ray_world * t;
             let dist = (closest - obj.position).length();
@@ -467,7 +709,12 @@ impl App {
             }
         }
 
-        self.dragging_object_id = best_id;
+        if let Some(id) = best_id {
+            self.dragging_object_id = Some(id);
+            if let Some(obj) = self.state.get_object_mut(id) {
+                obj.is_dragging = true;
+            }
+        }
     }
 
     fn update_drag(&mut self) {
@@ -496,6 +743,8 @@ impl App {
                 if let Some(obj) = self.state.get_object_mut(id) {
                     obj.position.x = intersection.x.clamp(-4.5, 4.5);
                     obj.position.z = intersection.z.clamp(-3.0, 3.0);
+                    obj.position.y = plane_y;
+                    self.update_object_transform(id);
                 }
             }
         }
@@ -510,15 +759,18 @@ impl App {
             rand::random::<f32>() * 3.0 - 1.5,
         );
         let object = DeskObject::new(id, object_type, position);
+        self.create_object_mesh(&object);
         self.state.add_object(object);
-        info!("Added {} object", object_type.display_name());
     }
 
     fn save_state(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.state.save()
     }
 
-    fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    fn create_depth_texture(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> wgpu::TextureView {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: wgpu::Extent3d {
@@ -536,81 +788,120 @@ impl App {
         texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    fn create_desk_mesh(device: &wgpu::Device) -> Mesh {
-        let (r, g, b) = config::hex_to_rgb(CONFIG.desk.color);
+    fn create_desk_mesh(device: &wgpu::Device) -> GpuMesh {
+        let (r, g, b) = hex_to_rgb(CONFIG.desk.color);
         let hw = CONFIG.desk.width / 2.0;
         let hd = CONFIG.desk.depth / 2.0;
         let h = CONFIG.desk.height;
 
         let vertices = vec![
             // Top
-            Vertex { position: [-hw, h, -hd], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [hw, h, -hd], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [hw, h, hd], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [-hw, h, hd], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
+            Vertex {
+                position: [-hw, h, -hd],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [hw, h, -hd],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [hw, h, hd],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [-hw, h, hd],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
             // Front
-            Vertex { position: [-hw, 0.0, hd], normal: [0.0, 0.0, 1.0], color: [r * 0.8, g * 0.8, b * 0.8, 1.0] },
-            Vertex { position: [hw, 0.0, hd], normal: [0.0, 0.0, 1.0], color: [r * 0.8, g * 0.8, b * 0.8, 1.0] },
-            Vertex { position: [hw, h, hd], normal: [0.0, 0.0, 1.0], color: [r * 0.8, g * 0.8, b * 0.8, 1.0] },
-            Vertex { position: [-hw, h, hd], normal: [0.0, 0.0, 1.0], color: [r * 0.8, g * 0.8, b * 0.8, 1.0] },
+            Vertex {
+                position: [-hw, 0.0, hd],
+                normal: [0.0, 0.0, 1.0],
+                color: [r * 0.8, g * 0.8, b * 0.8, 1.0],
+            },
+            Vertex {
+                position: [hw, 0.0, hd],
+                normal: [0.0, 0.0, 1.0],
+                color: [r * 0.8, g * 0.8, b * 0.8, 1.0],
+            },
+            Vertex {
+                position: [hw, h, hd],
+                normal: [0.0, 0.0, 1.0],
+                color: [r * 0.8, g * 0.8, b * 0.8, 1.0],
+            },
+            Vertex {
+                position: [-hw, h, hd],
+                normal: [0.0, 0.0, 1.0],
+                color: [r * 0.8, g * 0.8, b * 0.8, 1.0],
+            },
         ];
 
         let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
-        Self::create_mesh(device, &vertices, &indices)
-    }
 
-    fn create_floor_mesh(device: &wgpu::Device) -> Mesh {
-        let (r, g, b) = config::hex_to_rgb(CONFIG.colors.ground);
-        let s = 50.0;
-
-        let vertices = vec![
-            Vertex { position: [-s, 0.0, -s], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [s, 0.0, -s], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [s, 0.0, s], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-            Vertex { position: [-s, 0.0, s], normal: [0.0, 1.0, 0.0], color: [r, g, b, 1.0] },
-        ];
-
-        let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
-        Self::create_mesh(device, &vertices, &indices)
-    }
-
-    fn create_cube_mesh(device: &wgpu::Device) -> Mesh {
-        let vertices = vec![
-            // Front
-            Vertex { position: [-0.2, 0.0, 0.2], normal: [0.0, 0.0, 1.0], color: [0.8, 0.6, 0.3, 1.0] },
-            Vertex { position: [0.2, 0.0, 0.2], normal: [0.0, 0.0, 1.0], color: [0.8, 0.6, 0.3, 1.0] },
-            Vertex { position: [0.2, 0.4, 0.2], normal: [0.0, 0.0, 1.0], color: [0.8, 0.6, 0.3, 1.0] },
-            Vertex { position: [-0.2, 0.4, 0.2], normal: [0.0, 0.0, 1.0], color: [0.8, 0.6, 0.3, 1.0] },
-            // Top
-            Vertex { position: [-0.2, 0.4, 0.2], normal: [0.0, 1.0, 0.0], color: [0.9, 0.7, 0.4, 1.0] },
-            Vertex { position: [0.2, 0.4, 0.2], normal: [0.0, 1.0, 0.0], color: [0.9, 0.7, 0.4, 1.0] },
-            Vertex { position: [0.2, 0.4, -0.2], normal: [0.0, 1.0, 0.0], color: [0.9, 0.7, 0.4, 1.0] },
-            Vertex { position: [-0.2, 0.4, -0.2], normal: [0.0, 1.0, 0.0], color: [0.9, 0.7, 0.4, 1.0] },
-            // Right
-            Vertex { position: [0.2, 0.0, 0.2], normal: [1.0, 0.0, 0.0], color: [0.7, 0.5, 0.3, 1.0] },
-            Vertex { position: [0.2, 0.0, -0.2], normal: [1.0, 0.0, 0.0], color: [0.7, 0.5, 0.3, 1.0] },
-            Vertex { position: [0.2, 0.4, -0.2], normal: [1.0, 0.0, 0.0], color: [0.7, 0.5, 0.3, 1.0] },
-            Vertex { position: [0.2, 0.4, 0.2], normal: [1.0, 0.0, 0.0], color: [0.7, 0.5, 0.3, 1.0] },
-        ];
-
-        let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11];
-        Self::create_mesh(device, &vertices, &indices)
-    }
-
-    fn create_mesh(device: &wgpu::Device, vertices: &[Vertex], indices: &[u16]) -> Mesh {
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(vertices),
+            label: Some("Desk Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(indices),
+            label: Some("Desk Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        Mesh {
+        GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            num_indices: indices.len() as u32,
+        }
+    }
+
+    fn create_floor_mesh(device: &wgpu::Device) -> GpuMesh {
+        let (r, g, b) = hex_to_rgb(CONFIG.colors.ground);
+        let s = 50.0;
+
+        let vertices = vec![
+            Vertex {
+                position: [-s, 0.0, -s],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [s, 0.0, -s],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [s, 0.0, s],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+            Vertex {
+                position: [-s, 0.0, s],
+                normal: [0.0, 1.0, 0.0],
+                color: [r, g, b, 1.0],
+            },
+        ];
+
+        let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Floor Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Floor Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        GpuMesh {
             vertex_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
@@ -624,6 +915,13 @@ fn main() {
         .init();
 
     info!("Starting Focus Desktop Simulator...");
+    info!("Controls:");
+    info!("  T - Cycle through object types");
+    info!("  A - Add selected object");
+    info!("  Delete - Delete dragged object");
+    info!("  Click+Drag - Move object");
+    info!("  Scroll - Rotate object");
+    info!("  Shift+Scroll - Scale object");
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
 
@@ -640,35 +938,37 @@ fn main() {
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    event_loop.run(move |event, elwt| {
-        match event {
-            Event::WindowEvent { event, window_id } if window_id == window.id() => {
-                app.handle_event(&event);
+    event_loop
+        .run(move |event, elwt| {
+            match event {
+                Event::WindowEvent { event, window_id } if window_id == window.id() => {
+                    app.handle_event(&event);
 
-                match event {
-                    WindowEvent::CloseRequested => {
-                        info!("Saving state and exiting...");
-                        let _ = app.save_state();
-                        elwt.exit();
-                    }
-                    WindowEvent::Resized(size) => app.resize(size),
-                    WindowEvent::RedrawRequested => {
-                        app.update();
-                        if let Err(e) = app.render() {
-                            match e {
-                                wgpu::SurfaceError::Lost => app.resize(app.size),
-                                wgpu::SurfaceError::OutOfMemory => elwt.exit(),
-                                _ => log::error!("Render error: {:?}", e),
+                    match event {
+                        WindowEvent::CloseRequested => {
+                            info!("Saving state and exiting...");
+                            let _ = app.save_state();
+                            elwt.exit();
+                        }
+                        WindowEvent::Resized(size) => app.resize(size),
+                        WindowEvent::RedrawRequested => {
+                            app.update();
+                            if let Err(e) = app.render() {
+                                match e {
+                                    wgpu::SurfaceError::Lost => app.resize(app.size),
+                                    wgpu::SurfaceError::OutOfMemory => elwt.exit(),
+                                    _ => log::error!("Render error: {:?}", e),
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                Event::AboutToWait => {
+                    window.request_redraw();
+                }
+                _ => {}
             }
-            Event::AboutToWait => {
-                window.request_redraw();
-            }
-            _ => {}
-        }
-    }).expect("Event loop error");
+        })
+        .expect("Event loop error");
 }
