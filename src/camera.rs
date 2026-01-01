@@ -66,7 +66,7 @@ impl Camera {
     /// Calculate yaw and pitch angles from camera position and look-at point
     fn calculate_angles_from_look_at(camera_pos: Vec3, look_at: Vec3) -> (f32, f32) {
         let direction = look_at - camera_pos;
-        let horizontal_len = (direction.x * direction.x + direction.z * direction.z).sqrt();
+        let _horizontal_len = (direction.x * direction.x + direction.z * direction.z).sqrt();
 
         // Yaw: horizontal angle from positive Z axis
         let yaw = direction.x.atan2(direction.z);
@@ -110,7 +110,8 @@ impl Camera {
     /// Rotate camera based on mouse movement (pointer lock mode)
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
         // Update yaw (horizontal) - clamped to limits
-        self.yaw = (self.yaw + delta_x * self.sensitivity)
+        // Moving mouse right (positive delta_x) should rotate camera right (decrease yaw)
+        self.yaw = (self.yaw - delta_x * self.sensitivity)
             .clamp(self.min_yaw, self.max_yaw);
 
         // Update pitch (vertical) - clamped to limits

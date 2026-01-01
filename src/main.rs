@@ -84,6 +84,35 @@ impl ModelUniform {
     }
 }
 
+/// Maximum number of point lights
+const MAX_LIGHTS: usize = 8;
+
+/// Lighting uniform buffer data for dynamic lighting
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightingUniform {
+    /// Point light positions (xyz) and intensity (w)
+    /// w = 0.0 means light is off, w > 0 means on with that intensity
+    point_lights: [[f32; 4]; MAX_LIGHTS],
+    /// Number of active lights
+    num_lights: u32,
+    /// Room darkness level (0.0 = bright, 1.0 = very dark)
+    room_darkness: f32,
+    /// Padding for alignment
+    _padding: [f32; 2],
+}
+
+impl LightingUniform {
+    fn new() -> Self {
+        Self {
+            point_lights: [[0.0; 4]; MAX_LIGHTS],
+            num_lights: 0,
+            room_darkness: 1.0, // Start with dark room
+            _padding: [0.0; 2],
+        }
+    }
+}
+
 /// GPU mesh handle
 struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
@@ -123,6 +152,7 @@ struct App {
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
+    lighting_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     model_bind_group_layout: wgpu::BindGroupLayout,
     depth_texture: wgpu::TextureView,
@@ -217,28 +247,54 @@ impl App {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Create camera bind group layout
+        // Create lighting uniform buffer
+        let lighting_uniform = LightingUniform::new();
+        let lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Lighting Buffer"),
+            contents: bytemuck::cast_slice(&[lighting_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create camera/lighting bind group layout (group 0)
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
                 label: Some("camera_bind_group_layout"),
             });
 
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+            ],
             label: Some("camera_bind_group"),
         });
 
@@ -357,6 +413,7 @@ impl App {
             size,
             render_pipeline,
             camera_buffer,
+            lighting_buffer,
             camera_bind_group,
             model_bind_group_layout,
             depth_texture,
@@ -595,6 +652,40 @@ impl App {
         camera_uniform.update(&self.camera);
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
+
+        // Update lighting uniform based on lamp states
+        let mut lighting_uniform = LightingUniform::new();
+        let mut light_count = 0u32;
+
+        // Room is dark by default (darkness = 1.0)
+        lighting_uniform.room_darkness = 1.0;
+
+        // Find all lamps and add their lights
+        for obj in &self.state.objects {
+            if obj.object_type == ObjectType::Lamp && obj.state.lamp_on {
+                if light_count < MAX_LIGHTS as u32 {
+                    // Lamp light is at the lamp head position (approximately)
+                    // The lamp is about 0.8 units tall, light is at head (~0.75)
+                    let light_pos = Vec3::new(
+                        obj.position.x,
+                        obj.position.y + 0.75 * obj.scale,
+                        obj.position.z,
+                    );
+                    lighting_uniform.point_lights[light_count as usize] = [
+                        light_pos.x,
+                        light_pos.y,
+                        light_pos.z,
+                        2.5, // Light intensity
+                    ];
+                    light_count += 1;
+                }
+            }
+        }
+
+        lighting_uniform.num_lights = light_count;
+
+        self.queue
+            .write_buffer(&self.lighting_buffer, 0, bytemuck::cast_slice(&[lighting_uniform]));
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -869,9 +960,26 @@ impl App {
                 }
             }
             UiAction::SelectPhoto(id) => {
-                // Photo selection would normally open a file dialog
-                // For now, we just log the action
+                // Open file dialog to select an image
                 info!("Photo selection requested for frame {}", id);
+
+                // Use rfd to open a file dialog
+                let file = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                    .set_title("Select Photo for Frame")
+                    .pick_file();
+
+                if let Some(path) = file {
+                    let path_str = path.to_string_lossy().to_string();
+                    info!("Selected photo: {}", path_str);
+
+                    if let Some(obj) = self.state.get_object_mut(id) {
+                        obj.state.photo_path = Some(path_str.clone());
+                    }
+
+                    // TODO: In the future, load the image texture and apply it to the photo frame mesh
+                    // For now, we just store the path for persistence
+                }
             }
             UiAction::ChangeDrinkType(id, drink_type) => {
                 if let Some(obj) = self.state.get_object_mut(id) {
@@ -991,29 +1099,36 @@ impl App {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
                 };
 
-                if let Some(id) = self.dragging_object_id {
-                    // When dragging, scroll rotates or scales the object
-                    if self.shift_pressed {
-                        if let Some(obj) = self.state.get_object_mut(id) {
-                            obj.scale = (obj.scale + scroll * 0.1).clamp(0.3, 3.0);
-                            self.update_object_transform(id);
-                        }
-                    } else if let Some(obj) = self.state.get_object_mut(id) {
-                        obj.rotation = Quat::from_rotation_y(scroll * 0.2) * obj.rotation;
-                        self.update_object_transform(id);
+                // Get the object ID to manipulate (either dragging or under crosshair)
+                let target_id = self.dragging_object_id.or(
+                    if self.ui_state.pointer_locked {
+                        self.ui_state.crosshair_target_id
+                    } else {
+                        // Also support scroll on hovered object in non-pointer-lock mode
+                        self.find_object_at_cursor()
                     }
-                } else if self.ui_state.pointer_locked {
-                    // When in pointer lock mode but not dragging, scroll rotates object under crosshair
-                    if let Some(id) = self.ui_state.crosshair_target_id {
-                        if self.shift_pressed {
-                            if let Some(obj) = self.state.get_object_mut(id) {
-                                obj.scale = (obj.scale + scroll * 0.1).clamp(0.3, 3.0);
-                                self.update_object_transform(id);
-                            }
-                        } else if let Some(obj) = self.state.get_object_mut(id) {
-                            obj.rotation = Quat::from_rotation_y(scroll * 0.2) * obj.rotation;
-                            self.update_object_transform(id);
+                );
+
+                if let Some(id) = target_id {
+                    if self.shift_pressed {
+                        // Shift+Scroll scales the object
+                        let new_scale = if let Some(obj) = self.state.get_object_mut(id) {
+                            // Use a larger multiplier for more noticeable scaling
+                            obj.scale = (obj.scale + scroll * 0.15).clamp(0.3, 3.0);
+                            Some(obj.scale)
+                        } else {
+                            None
+                        };
+                        self.update_object_transform(id);
+                        if let Some(scale) = new_scale {
+                            info!("Scaled object to {:.2}", scale);
                         }
+                    } else {
+                        // Scroll rotates the object
+                        if let Some(obj) = self.state.get_object_mut(id) {
+                            obj.rotation = Quat::from_rotation_y(scroll * 0.2) * obj.rotation;
+                        }
+                        self.update_object_transform(id);
                     }
                 }
             }

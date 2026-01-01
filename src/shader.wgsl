@@ -1,10 +1,26 @@
 // Focus Desktop Simulator - Main Shader
-// WGSL shader for 3D rendering with basic lighting and model transforms
+// WGSL shader for 3D rendering with dynamic lighting and model transforms
+
+// Maximum number of point lights (lamps)
+const MAX_LIGHTS: u32 = 8u;
 
 // Camera uniform buffer
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     position: vec4<f32>,
+}
+
+// Scene lighting uniform buffer
+struct LightingUniform {
+    // Array of point light positions (xyz) and intensity (w)
+    // w = 0.0 means light is off, w > 0 means on with that intensity
+    point_lights: array<vec4<f32>, 8>,
+    // Number of active lights
+    num_lights: u32,
+    // Room darkness level (0.0 = bright, 1.0 = very dark)
+    room_darkness: f32,
+    // Padding for alignment
+    _padding: vec2<f32>,
 }
 
 // Model uniform buffer for per-object transforms
@@ -14,6 +30,9 @@ struct ModelUniform {
 
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
+
+@group(0) @binding(1)
+var<uniform> lighting: LightingUniform;
 
 @group(1) @binding(0)
 var<uniform> model: ModelUniform;
@@ -60,31 +79,65 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-// Fragment shader with basic lighting
+// Fragment shader with dynamic lighting from lamps
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Light direction (from top-right)
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-
-    // Ambient light
-    let ambient_color = vec3<f32>(0.25, 0.25, 0.35);
-
-    // Directional light
     let normal = normalize(in.world_normal);
-    let diffuse = max(dot(normal, light_dir), 0.0);
 
-    // Combine lighting
-    let light = ambient_color + diffuse * vec3<f32>(0.8, 0.8, 0.75);
+    // Base ambient light - very dim when room is dark
+    // When room_darkness = 1.0, ambient is very low (0.03)
+    // When room_darkness = 0.0, ambient is normal (0.25)
+    let base_ambient = 0.25;
+    let dark_ambient = 0.03;
+    let ambient_level = mix(base_ambient, dark_ambient, lighting.room_darkness);
+    var total_light = vec3<f32>(ambient_level, ambient_level, ambient_level * 1.2);
+
+    // Weak directional light from above (simulating very dim ceiling light)
+    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.2));
+    let directional_intensity = mix(0.15, 0.02, lighting.room_darkness);
+    let directional = max(dot(normal, light_dir), 0.0) * directional_intensity;
+    total_light = total_light + vec3<f32>(directional, directional, directional * 0.9);
+
+    // Calculate point light contributions from lamps
+    for (var i: u32 = 0u; i < lighting.num_lights; i = i + 1u) {
+        let light_pos = lighting.point_lights[i].xyz;
+        let light_intensity = lighting.point_lights[i].w;
+
+        if (light_intensity > 0.0) {
+            // Direction from fragment to light
+            let to_light = light_pos - in.world_position;
+            let distance = length(to_light);
+            let light_direction = normalize(to_light);
+
+            // Attenuation (quadratic falloff with distance)
+            let attenuation = light_intensity / (1.0 + 0.3 * distance + 0.1 * distance * distance);
+
+            // Diffuse lighting
+            let n_dot_l = max(dot(normal, light_direction), 0.0);
+
+            // Warm lamp light color (yellowish)
+            let lamp_color = vec3<f32>(1.0, 0.9, 0.7);
+
+            // Add point light contribution
+            total_light = total_light + lamp_color * n_dot_l * attenuation;
+
+            // Add some ambient contribution from the lamp to nearby surfaces
+            let ambient_boost = attenuation * 0.3;
+            total_light = total_light + lamp_color * ambient_boost;
+        }
+    }
 
     // Apply lighting to base color
-    let lit_color = in.color.rgb * light;
+    let lit_color = in.color.rgb * total_light;
 
     // Simple fog effect based on distance from camera
     let dist = length(in.world_position - camera.position.xyz);
     let fog_factor = 1.0 - clamp((dist - 10.0) / 40.0, 0.0, 0.6);
 
-    // Background/fog color
-    let fog_color = vec3<f32>(0.1, 0.1, 0.18);
+    // Background/fog color - darker when room is dark
+    let base_fog = vec3<f32>(0.1, 0.1, 0.18);
+    let dark_fog = vec3<f32>(0.02, 0.02, 0.04);
+    let fog_color = mix(base_fog, dark_fog, lighting.room_darkness);
 
     let final_color = mix(fog_color, lit_color, fog_factor);
 

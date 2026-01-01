@@ -50,6 +50,9 @@ egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
 
+# Native file dialog
+rfd = "0.15"
+
 [profile.release]
 opt-level = 3
 lto = true

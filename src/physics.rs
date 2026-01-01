@@ -203,7 +203,7 @@ impl PhysicsEngine {
     pub fn update_dropping(
         &self,
         object: &mut DeskObject,
-        other_objects: &[DeskObject],
+        _other_objects: &[DeskObject],
         drop_speed: f32,
     ) -> bool {
         if !object.is_dragging && (object.position.y - object.target_y).abs() > 0.001 {
